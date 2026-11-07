@@ -1,0 +1,23 @@
+# Challenge data must never be committed
+data/
+cold-start/data/
+*.zip
+
+# Generated outputs & cache
+out.json
+out_*.json
+output.json
+cold-start/out.json
+cold-start/out_*.json
+usage.jsonl
+cold-start/usage.jsonl
+.cache_llm/
+cold-start/.cache_llm/
+
+# Python & IDE
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv/
+.vscode/
