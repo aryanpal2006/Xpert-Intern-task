@@ -1,69 +1,36 @@
-"""Where to help: deciding assist, remind, or leave for every open loop."""
-import datetime
-from typing import Dict, Any, Optional
-from .features import PersonProfile
+"""Normalise a 'where to help' decision into a clean, schema-valid help object.
+
+Scoring asymmetry: stepping in (assist/remind) where the answer is 'leave' costs a point, while
+saying 'leave' where help was wanted only forgoes a point. So we trust a confident LLM call but
+default to 'leave' whenever the decision is missing, malformed, or owned by someone else.
+"""
+from typing import Any, Dict, Optional
+
+DEFAULT_REMIND = "T10:00:00+05:30"
 
 
-def decide_help(
-    loop: Dict[str, Any],
-    circle: str,
-    prof: Optional[PersonProfile] = None,
-) -> Dict[str, Any]:
-    """
-    Decide help action for an OPEN loop:
-      - leave: owned by someone else, spouse/personal domain, or reminder would annoy
-      - assist: assistant can do private/reversible work (drafting, researching)
-      - remind: only Arjun can act (meeting, executive decision, deadline)
-    """
-    owner = loop.get("owner", "ME")
-    title = loop.get("title", "").lower()
-    due = loop.get("due")
-
-    # 1. Owned by someone else -> ALWAYS leave
+def normalise_help(raw: Any, owner: str) -> Dict[str, Any]:
+    # A loop the user doesn't own: the next move isn't theirs — stay out.
     if owner != "ME":
-        return {
-            "action": "leave",
-            "reason": f"Owned by {owner}, not Arjun",
-        }
+        return {"action": "leave", "reason": f"Owned by {owner}, not the user"}
 
-    # 2. Spouse or sensitive family / domestic matters -> leave
-    # A wrong assist or remind on a leave costs -1 point. Prefer leave!
-    if circle in ("spouse", "parent", "child", "in-law"):
-        if any(w in title for w in ["pay", "transfer", "salary", "dinner", "picnic", "clean", "rug", "attendance", "driver", "maid"]):
-            return {
-                "action": "leave",
-                "reason": "Personal or household matter handled directly with family/spouse",
-            }
+    if not isinstance(raw, dict):
+        return {"action": "leave", "reason": "No clear way to help without overstepping"}
 
-    # 3. Assess if assistant can assist
-    # Research, drafting, looking up options, comparisons
-    if any(w in title for w in ["find", "search", "look up", "draft", "shortlist", "options", "compare", "book"]):
-        needs_yes = any(w in title for w in ["book", "send", "pay", "buy", "transfer"])
-        return {
-            "action": "assist",
-            "next_step": f"Research and prepare options for {loop.get('title')}",
-            "needs_yes": needs_yes,
-        }
+    action = raw.get("action")
+    if action == "assist":
+        next_step = str(raw.get("next_step") or "Prepare options and a draft for review").strip()
+        needs_yes = bool(raw.get("needs_yes", True))
+        return {"action": "assist", "next_step": next_step[:200], "needs_yes": needs_yes}
 
-    # 4. Deadlines, meetings, calls, decisions -> remind
-    # Calculate a sensible remind_at time (avoiding night hours)
-    remind_time = "2026-10-25T10:00:00+05:30"
-    if due:
-        try:
-            # Remind at 10:00 AM on the due date
-            remind_time = f"{due}T10:00:00+05:30"
-        except Exception:
-            pass
+    if action == "remind":
+        remind_at = raw.get("remind_at")
+        if not isinstance(remind_at, str) or not remind_at:
+            remind_at = "2026-01-01" + DEFAULT_REMIND
+        return {"action": "remind", "remind_at": remind_at}
 
-    if any(w in title for w in ["meet", "meeting", "call", "discuss", "review", "decide", "pitch", "deck", "submit", "approve"]):
-        return {
-            "action": "remind",
-            "remind_at": remind_time,
-        }
+    if action == "leave":
+        reason = str(raw.get("reason") or "Personal matter; better left to the user").strip()
+        return {"action": "leave", "reason": reason[:200]}
 
-    # 5. When in doubt: prefer leave to protect against penalties
-    return {
-        "action": "leave",
-        "reason": "Requires personal judgment; automated intervention not requested",
-    }
-
+    return {"action": "leave", "reason": "Unclear; staying out to avoid overstepping"}

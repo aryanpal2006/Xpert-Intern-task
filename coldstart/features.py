@@ -1,22 +1,23 @@
-"""Feature extraction per person and per chat for circle, organisation, and loop analysis."""
-import re
-from collections import Counter, defaultdict
-from typing import Dict, List, Any, Set
+"""Name-agnostic feature extraction per person and per chat.
+
+Everything here is structural: who talks to whom, how much, in which chats, and a sample of the
+actual message text. We deliberately avoid hardcoding any names, places, or dev-set specifics so
+the signals generalise to the re-anonymised hidden set.
+"""
+from collections import defaultdict
+from typing import Dict, List, Optional
 from .load import DataLoader
 
-# Kinship and relationship token patterns
-KINSHIP_PATTERNS = {
-    "staff": re.compile(r"\b(driver|cook|maid|bhaiya|gardener|guard|security|electrician|plumber|cleaner|housekeeper|delivery|carpenter|attendance|salary|kitchen|ration|chhutti|leave|gatekeeper|sweeper|car\s*wash|mechanic)\b", re.I),
-    "spouse": re.compile(r"\b(wife|husband|nayna|biwi|jaan|darling|babe|sweetheart|dinner|carpool|groceries|preschool|kids|school|home\s*is\s*where)\b", re.I),
-    "parent": re.compile(r"\b(mummy|papa|mom|dad|maa|father|mother|sasur|saas|blessings|pranam|namaste)\b", re.I),
-    "child": re.compile(r"\b(beta|beti|son|daughter|tuition|homework|preschool|daycare|kindergarten)\b", re.I),
-    "sibling": re.compile(r"\b(bhai|bro|didi|sister|brother|bhiya|rakhi)\b", re.I),
-    "relative": re.compile(r"\b(chacha|chachi|mama|mami|bua|fufa|cousin|mausi|bhabhi|jiju|family|family\s*tree|gathering)\b", re.I),
-    "colleague": re.compile(r"\b(colleague|team|sprint|deploy|standup|ops|operations|marketing|leads|campaign|jira|github|pr|repo|bug|review|dashboard|ad\s*targeting|roas|cpc|meta\s*ads|google\s*ads|pma|nexus|daas)\b", re.I),
-    "client": re.compile(r"\b(client|account|brief|deliverable|scope|retainer|ad\s*targeting|onboarding|agency|creative|assets|campaign\s*report)\b", re.I),
-    "vendor": re.compile(r"\b(vendor|supplier|invoice|quotation|estimate|gst|bill|payment|rates|trading\s*company|trainer|yoga|gym\s*trainer|printing|catering)\b", re.I),
-    "partner": re.compile(r"\b(partner|co-founder|equity|investor|shares|board|round|valuation|seed|term\s*sheet|angel)\b", re.I),
-    "friend": re.compile(r"\b(bro|dude|yaar|bhai|plans|party|beer|drinks|dinner|table\s*tennis|badminton|pickleball|sports|tt|trip|vacation|game|fifa|movie)\b", re.I),
+# Relationship *words* (not personal names) that commonly survive re-anonymisation because they are
+# how contacts are saved (honorifics, kinship terms, emoji). Used only as weak hints for the
+# deterministic fallback; the LLM path reads raw text instead.
+KINSHIP_HINTS = {
+    "spouse": ["❤", "😘", "wife", "husband", "hubby", "jaan", "love", "pati", "patni", "biwi"],
+    "parent": ["mummy", "mum", "mom", "papa", "dad", "father", "mother", "maa", "ma ", "daddy"],
+    "sibling": ["didi", "bhai", "bhaiya", "bro", "sis", "sister", "brother", "bhaiyya"],
+    "child": ["beta", "beti", "son", "daughter", "junior"],
+    "relative": ["chacha", "chachi", "mama", "mami", "bua", "fufa", "cousin", "mausi", "bhabhi",
+                 "jiju", "nana", "nani", "dada", "dadi", "uncle", "aunty", "aunt"],
 }
 
 
@@ -29,42 +30,53 @@ class PersonProfile:
         self.has_1on1_chat: bool = False
         self.one_on_one_chat_id: str = ""
         self.one_on_one_chat_name: str = ""
-        self.messages_from_person: List[str] = []
-        self.messages_to_person: List[str] = []
-        self.keyword_scores: Dict[str, int] = defaultdict(int)
+        self.msgs_from_person: List[str] = []   # things this person said
+        self.msgs_from_me: List[str] = []        # things ME said to them (1:1 only)
+        self.n_from_person: int = 0
+        self.n_from_me: int = 0
         self.seeded_circle: str = ""
 
-    def summary(self) -> str:
-        names_str = ", ".join(self.names[:3])
-        chats_str = ", ".join(self.group_chat_names[:4])
-        sample_in = " | ".join(self.messages_from_person[:4])
-        sample_out = " | ".join(self.messages_to_person[:4])
-        return (
-            f"Person {self.id} (Names: {names_str}):\n"
-            f"  1:1 Chat: {self.one_on_one_chat_name if self.has_1on1_chat else 'None'}\n"
-            f"  Group Chats: {chats_str}\n"
-            f"  From Person ({len(self.messages_from_person)} msgs): {sample_in[:200]}\n"
-            f"  From ME ({len(self.messages_to_person)} msgs): {sample_out[:200]}\n"
-        )
+    def best_name(self) -> str:
+        return self.names[0] if self.names else self.id
+
+    def compact(self, max_msgs: int = 4, max_len: int = 110) -> str:
+        """A compact, name-light block for an LLM prompt."""
+        def clip(items):
+            out = []
+            for t in items[:max_msgs]:
+                t = " ".join(t.split())
+                out.append(t[:max_len])
+            return out
+
+        lines = [f"person_id: {self.id}"]
+        if self.names:
+            lines.append(f"saved_as: {', '.join(self.names[:3])}")
+        lines.append(f"has_direct_chat: {'yes' if self.has_1on1_chat else 'no'}"
+                     f" (they sent {self.n_from_person}, user sent {self.n_from_me})")
+        if self.group_chat_names:
+            lines.append(f"shared_groups: {', '.join(self.group_chat_names[:6])}")
+        sample_them = clip(self.msgs_from_person)
+        sample_me = clip(self.msgs_from_me)
+        if sample_them:
+            lines.append("they_said: " + " || ".join(sample_them))
+        if sample_me:
+            lines.append("user_said_to_them: " + " || ".join(sample_me))
+        return "\n".join(lines)
 
 
-def extract_person_profiles(loader: DataLoader) -> Dict[str, PersonProfile]:
+def extract_person_profiles(loader: DataLoader, sample_cap: int = 12) -> Dict[str, PersonProfile]:
     profiles: Dict[str, PersonProfile] = {p: PersonProfile(p) for p in loader.all_people}
 
-    # Load seeded circles
     seeded_circles = loader.seed.get("circles") or {}
     for pid, circ in seeded_circles.items():
         if pid in profiles:
             profiles[pid].seeded_circle = circ
 
-    # Chat associations
     for c in loader.raw_chats:
         cid = c["chat_id"]
-        cname = c.get("name", "")
-        parts = c.get("participants", [])
+        cname = c.get("name", "") or ""
         is_group = c.get("is_group", False)
-
-        for p in parts:
+        for p in c.get("participants", []):
             if p == "ME" or p not in profiles:
                 continue
             profiles[p].chat_ids.append(cid)
@@ -76,40 +88,39 @@ def extract_person_profiles(loader: DataLoader) -> Dict[str, PersonProfile]:
                 profiles[p].one_on_one_chat_id = cid
                 profiles[p].one_on_one_chat_name = cname
 
-    # Add names from loader
     for pid, names in loader.person_names.items():
         if pid in profiles:
             profiles[pid].names = names
 
-    # Message analysis
+    # Collect message samples: spread across time so we don't only see the first few lines.
     for m in loader.raw_messages:
         sid = m.get("sender_id")
-        body = m.get("body", "") or ""
+        body = (m.get("body") or "").strip()
+        if not body:
+            continue
         cid = m.get("chat_id")
         chat = loader.chats_by_id.get(cid, {})
         is_group = chat.get("is_group", False)
         parts = chat.get("participants", [])
 
-        if sid in profiles and len(profiles[sid].messages_from_person) < 25:
-            if body.strip():
-                profiles[sid].messages_from_person.append(body.strip())
+        if sid in profiles:
+            profiles[sid].n_from_person += 1
+            if len(profiles[sid].msgs_from_person) < sample_cap:
+                profiles[sid].msgs_from_person.append(body)
         elif sid == "ME" and not is_group:
-            # 1:1 message from ME to the other participant
             other = next((p for p in parts if p != "ME"), None)
-            if other and other in profiles and len(profiles[other].messages_to_person) < 25:
-                if body.strip():
-                    profiles[other].messages_to_person.append(body.strip())
-
-    # Calculate keyword scores
-    for pid, prof in profiles.items():
-        combined_text = " ".join(
-            prof.names + prof.group_chat_names + [prof.one_on_one_chat_name] +
-            prof.messages_from_person + prof.messages_to_person
-        )
-        for cat, pat in KINSHIP_PATTERNS.items():
-            matches = len(pat.findall(combined_text))
-            if matches > 0:
-                prof.keyword_scores[cat] += matches
+            if other and other in profiles:
+                profiles[other].n_from_me += 1
+                if len(profiles[other].msgs_from_me) < sample_cap:
+                    profiles[other].msgs_from_me.append(body)
 
     return profiles
 
+
+def kinship_hint(profile: PersonProfile) -> Optional[str]:
+    """Weak, name-free guess from how the contact is saved. Used only as a deterministic fallback."""
+    text = " ".join(profile.names + [profile.one_on_one_chat_name]).lower()
+    for circle, hints in KINSHIP_HINTS.items():
+        if any(h in text for h in hints):
+            return circle
+    return None

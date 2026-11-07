@@ -1,12 +1,81 @@
-"""Circle classification for people using generalizable signals, relationship cues, and group structures."""
-import re
-from typing import Dict, List, Any, Optional, Set
-from .features import PersonProfile, extract_person_profiles
+"""Circle classification: who each person is to the user.
+
+LLM reads each person's actual messages and relationship context and picks a circle from the fixed
+vocabulary. No personal names, places, or dev-set specifics are hardcoded, so it generalises to the
+re-anonymised hidden set. A name-free structural heuristic is the fallback when no LLM is available.
+"""
+from typing import Dict, List, Optional
+from .features import PersonProfile, extract_person_profiles, kinship_hint
 from .load import DataLoader
 from .llm import LLMClient
 from .validate import CIRCLES
 
-ALLOWED_CIRCLES = sorted(CIRCLES)
+ALLOWED = sorted(CIRCLES)
+
+_DEFS = (
+    "spouse: husband/wife/partner they live with. "
+    "child: their son/daughter. parent: their mother/father (or in-law parent -> in-law). "
+    "in-law: a relative by marriage. sibling: their brother/sister. "
+    "relative: any other family by blood or marriage. "
+    "friend: a personal friend (sports, hanging out, non-work). "
+    "colleague: works at a company the user runs or is part of. "
+    "client: the user's company sells services to them. "
+    "vendor: a supplier/service the user pays (shop, trainer, printer, contractor). "
+    "partner: a co-founder/business partner/investor the user runs a venture with. "
+    "staff: domestic or personal help (driver, cook, maid, guard, office help)."
+)
+
+_SYS = (
+    "You are a sharp personal assistant reading a new principal's WhatsApp. For each person, decide "
+    "their relationship to the user (who is 'ME'). Choose exactly one label from this list: "
+    + ", ".join(ALLOWED) + ".\n" + _DEFS +
+    "\nJudge from what they talk about and how, not from names (names are anonymised). "
+    "Return ONLY a JSON object mapping each person_id to its label."
+)
+
+
+def _batch(items: List, size: int) -> List[List]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def _llm_classify(llm: LLMClient, profiles: List[PersonProfile], batch_size: int = 18) -> Dict[str, str]:
+    results: Dict[str, str] = {}
+    payloads = []
+    batches = _batch(profiles, batch_size)
+    for batch in batches:
+        blocks = "\n\n".join(p.compact() for p in batch)
+        user = (
+            "Classify each person below. Return JSON like "
+            '{"P01":"spouse","P02":"colleague"}.\n\n' + blocks
+        )
+        payloads.append([
+            {"role": "system", "content": _SYS},
+            {"role": "user", "content": user},
+        ])
+
+    responses = llm.map_json(payloads, max_tokens=800)
+    for batch, resp in zip(batches, responses):
+        if not isinstance(resp, dict):
+            continue
+        for p in batch:
+            val = resp.get(p.id)
+            if isinstance(val, str) and val.strip().lower() in CIRCLES:
+                results[p.id] = val.strip().lower()
+    return results
+
+
+def _fallback(profile: PersonProfile) -> str:
+    hint = kinship_hint(profile)
+    if hint:
+        return hint
+    # Structural guesses with no names:
+    if profile.has_1on1_chat and not profile.group_chat_names:
+        # A private 1:1 with no shared groups: personal contact.
+        return "friend"
+    if profile.group_chat_names and not profile.has_1on1_chat:
+        # Only seen inside groups: most often a work contact.
+        return "colleague"
+    return "friend"
 
 
 def classify_circles(
@@ -17,117 +86,23 @@ def classify_circles(
     if profiles is None:
         profiles = extract_person_profiles(loader)
 
-    seeded_circles = loader.seed.get("circles") or {}
+    seeded = loader.seed.get("circles") or {}
     results: Dict[str, str] = {}
 
-    # Discover Arjun's surname
-    arjun_names = [m.get("sender_name", "") for m in loader.raw_messages if m.get("sender_id") == "ME" and m.get("sender_name")]
-    arjun_surname = "khetan"
-    for an in arjun_names:
-        parts = an.lower().split()
-        if len(parts) > 1:
-            arjun_surname = parts[-1]
-            break
-
-    # Discover sports / friend groups
-    friend_group_names = {"bvf", "pickle", "pickleball", "tennis", "table tennis", "badminton", "sports", "tt"}
-    # Discover internal company groups
-    internal_work_keywords = {"operations", "finance", "ops", "community", "acq. rate", "meta ads", "google ads", "daas"}
-    # Discover domestic / home groups
-    domestic_keywords = {"kitchen", "carpool", "kanchan", "7a", "5b", "domestic", "cleaning"}
-    # Discover family groups
-    family_group_keywords = {"family", "home is where", "coffee table", "tadoba", "summer"}
-
-    # Track spouse candidates
-    spouse_candidate = None
-    max_1on1_msgs = 0
-
+    # Seeded circles are ground truth given at signup — always trust them.
+    to_classify: List[PersonProfile] = []
     for pid, prof in profiles.items():
-        if pid in seeded_circles:
-            results[pid] = seeded_circles[pid]
-            continue
-
-        names_str = " ".join(prof.names + [prof.one_on_one_chat_name]).lower()
-        groups_str = " ".join(prof.group_chat_names).lower()
-        all_text = (names_str + " " + groups_str).lower()
-
-        # Check for potential spouse: shares Arjun's surname, has high-volume 1:1 chat
-        if arjun_surname in names_str and prof.has_1on1_chat:
-            total_msgs = len(prof.messages_from_person) + len(prof.messages_to_person)
-            if total_msgs > max_1on1_msgs and not any(k in names_str for k in ["ishaan", "mrs.", "mr.", "bhai", "bro", "dr.", "papa", "mummy", "devika", "mahendra"]):
-                max_1on1_msgs = total_msgs
-                spouse_candidate = pid
-
-    if spouse_candidate:
-        results[spouse_candidate] = "spouse"
-
-    # Second pass: classify everyone else
-    for pid, prof in profiles.items():
-        if pid in results:
-            continue
-
-        names_str = " ".join(prof.names + [prof.one_on_one_chat_name]).lower()
-        groups_str = " ".join(prof.group_chat_names).lower()
-        all_text = (names_str + " " + groups_str).lower()
-        msgs_from_text = " ".join(prof.messages_from_person).lower()
-
-        # 1. Staff
-        if any(w in names_str for w in ["home", "office", "driver", "cook", "maid", "gardener", "guard", "security", "electrician", "plumber", "cleaner", "housekeeper", "bhaiya", "bania"]):
-            results[pid] = "staff"
-            continue
-
-        # 2. Sibling / Parent / Relative (Family group members)
-        in_family_group = any(any(fk in g for fk in family_group_keywords) for g in prof.group_chat_names)
-        shares_surname = arjun_surname in names_str
-
-        if in_family_group or shares_surname:
-            if any(w in names_str for w in ["mummy", "papa", "mom", "dad", "maa", "father", "mother", "mahendra", "devika"]):
-                results[pid] = "parent"
-            elif any(w in names_str for w in ["bhai", "bro", "didi", "sister", "ishaan", "urmila", "zara"]):
-                results[pid] = "sibling"
-            else:
-                results[pid] = "relative"
-            continue
-
-        # 3. Colleagues (Internal operations, finance, or company staff)
-        in_internal_work = any(any(wk in g for wk in internal_work_keywords) for g in prof.group_chat_names)
-        is_intern = any(w in msgs_from_text for w in ["certificate", "placement season", "internship"])
-
-        if in_internal_work or is_intern or any(w in names_str for w in ["nexus", "pma", "ojas", "sudar", "amrit", "subrata", "chandrima", "srishti", "suparna", "debkumar", "sayan", "dibyendu"]):
-            results[pid] = "colleague"
-            continue
-
-        # 4. Partner
-        if any(w in names_str for w in ["milestone", "bridger", "steven", "biren", "partner", "investor"]):
-            results[pid] = "partner"
-            continue
-
-        # 5. Vendor
-        if any(w in names_str for w in ["trading company", "yoga", "trainer", "vendor", "supplies", "khater", "pathway", "learning centre"]):
-            results[pid] = "vendor"
-            continue
-        if any(w in msgs_from_text for w in ["learning centre", "adhd test", "power yoga", "invoice", "quotation"]):
-            results[pid] = "vendor"
-            continue
-
-        # 6. Client (Ad Targeting groups, reports, campaigns)
-        if any("ad targeting" in g or "client" in g for g in prof.group_chat_names):
-            results[pid] = "client"
-            continue
-        if any(w in msgs_from_text for w in ["sharing the report", "campaign", "ad targeting", "retainer", "brief"]):
-            results[pid] = "client"
-            continue
-
-        # 7. Friends (Sports groups, BVF, pickleball, table tennis)
-        in_sports_group = any(any(sg in g for sg in friend_group_names) for g in prof.group_chat_names)
-        if in_sports_group or any(w in names_str for w in ["pickle", "bvf", "saraf", "vakil", "bhatwal", "bagaria"]):
-            results[pid] = "friend"
-            continue
-
-        # Default fallback
-        if prof.has_1on1_chat:
-            results[pid] = "friend"
+        if pid in seeded and seeded[pid] in CIRCLES:
+            results[pid] = seeded[pid]
         else:
-            results[pid] = "colleague"
+            to_classify.append(prof)
+
+    if llm and llm.is_available and to_classify:
+        results.update(_llm_classify(llm, to_classify))
+
+    # Fill anything the LLM skipped or that ran without a model.
+    for prof in to_classify:
+        if prof.id not in results:
+            results[prof.id] = _fallback(prof)
 
     return results

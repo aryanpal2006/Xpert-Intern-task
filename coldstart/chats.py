@@ -1,68 +1,64 @@
-"""Chat assignment: mapping 1:1 chats to persons and group chats to organisations."""
+"""Chat assignment: every chat tied to exactly one person or one organisation.
+
+Direct (1:1) chats tie to the other person unless the organisation step decided the chat belongs to
+an organisation (e.g. a vendor or office line). Group chats tie to their organisation. Any group
+left unmapped is attached by the circle-majority of its members so that no chat is left untied.
+"""
+from collections import Counter
 from typing import Dict, List, Any
 from .load import DataLoader
-from .features import PersonProfile
+
+HOME_CIRCLES = {"spouse", "child", "parent", "in-law", "sibling", "relative"}
+WORK_CIRCLES = {"colleague", "partner", "client"}
 
 
 def assign_chats(
     loader: DataLoader,
+    chat_map: Dict[str, str],
     organisations: List[Dict[str, Any]],
     circles: Dict[str, str],
-    profiles: Dict[str, PersonProfile],
 ) -> List[Dict[str, str]]:
     ties: List[Dict[str, str]] = []
-    
-    org_by_name = {o["name"].lower(): o["id"] for o in organisations}
     valid_org_ids = [o["id"] for o in organisations]
-    default_work_org = valid_org_ids[0]
+    org_ids = set(valid_org_ids)
 
-    home_id = next((o["id"] for o in organisations if "home" in o["name"].lower()), valid_org_ids[-1])
-    office_id = next((o["id"] for o in organisations if "office" in o["name"].lower()), default_work_org)
-    
-    # PMA / PostMyAd
-    pma_id = next((o["id"] for o in organisations if "post" in o["name"].lower() or "pma" in o["name"].lower()), default_work_org)
-    # Nexus
-    nexus_id = next((o["id"] for o in organisations if "nexus" in o["name"].lower() and "daas" not in o["name"].lower()), default_work_org)
-    # DaaS
-    daas_id = next((o["id"] for o in organisations if "daas" in o["name"].lower()), default_work_org)
-    # Radiant
-    radiant_id = next((o["id"] for o in organisations if "radiant" in o["name"].lower()), default_work_org)
+    home_default = next((o["id"] for o in organisations if o["side"] == "home"), None)
+    work_default = next((o["id"] for o in organisations if o["side"] == "work"), None)
+    any_default = valid_org_ids[0] if valid_org_ids else None
 
     for chat in loader.raw_chats:
         cid = chat["chat_id"]
-        cname = chat.get("name", "")
-        lower_name = cname.lower()
         is_group = chat.get("is_group", False)
-        participants = [p for p in chat.get("participants", []) if p != "ME"]
-        other_pid = participants[0] if participants else None
+        parts = [p for p in chat.get("participants", []) if p != "ME"]
 
+        # 1:1 chats always tie to the other person (a vendor/client is not an organisation).
         if not is_group:
-            # 1:1 chat
-            # Operational 1:1 chats
-            if "pradip ghosh" in lower_name:
-                ties.append({"chat_id": cid, "organisation": home_id})
-            elif any(w in lower_name for w in ["nisha dalkar", "subrata bhatnagar", "amrit bhatnagar"]):
-                ties.append({"chat_id": cid, "organisation": pma_id})
-            elif "rajarshi devit" in lower_name:
-                ties.append({"chat_id": cid, "organisation": daas_id})
-            elif lower_name == "suparna" and not is_group:
-                ties.append({"chat_id": cid, "organisation": nexus_id})
-            else:
-                if other_pid:
-                    ties.append({"chat_id": cid, "person": other_pid})
-                else:
-                    ties.append({"chat_id": cid, "organisation": default_work_org})
+            if parts:
+                ties.append({"chat_id": cid, "person": parts[0]})
+            elif any_default:
+                ties.append({"chat_id": cid, "organisation": any_default})
+            continue
+
+        mapped = chat_map.get(cid)
+        if mapped in org_ids:
+            ties.append({"chat_id": cid, "organisation": mapped})
+            continue
+
+        # Unmapped group chat: attach by circle majority of members.
+        circ = Counter(circles.get(p, "friend") for p in parts)
+        home_votes = sum(circ[k] for k in HOME_CIRCLES) + circ["staff"]
+        work_votes = sum(circ[k] for k in WORK_CIRCLES) + circ["vendor"]
+        target = None
+        if home_votes > work_votes and home_default:
+            target = home_default
+        elif work_default:
+            target = work_default
         else:
-            # Group chat
-            if any(w in lower_name for w in ["carpool", "kitchen", "kanchan", "7a", "5b"]):
-                ties.append({"chat_id": cid, "organisation": home_id})
-            elif "radiant" in lower_name:
-                ties.append({"chat_id": cid, "organisation": radiant_id})
-            elif any(w in lower_name for w in ["pma", "postmyad", "acq. rate"]):
-                ties.append({"chat_id": cid, "organisation": pma_id})
-            elif any(w in lower_name for w in ["daas", "milestone"]):
-                ties.append({"chat_id": cid, "organisation": daas_id})
-            else:
-                ties.append({"chat_id": cid, "organisation": nexus_id})
+            target = home_default or any_default
+        if target:
+            ties.append({"chat_id": cid, "organisation": target})
+        elif parts:
+            # No organisations at all: fall back to a person so the chat is still tied.
+            ties.append({"chat_id": cid, "person": parts[0]})
 
     return ties

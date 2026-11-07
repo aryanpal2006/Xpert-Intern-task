@@ -27,13 +27,13 @@ def build_solution(input_dir: str, no_llm: bool = False) -> dict:
     # 2. Circle classification
     circles = classify_circles(loader, llm=llm, profiles=profiles)
 
-    # 3. Organisations and links
-    organisations, person_links, person_looks_after = discover_organisations(
+    # 3. Organisations, chat->org clustering, and links
+    organisations, chat_map, person_links, person_looks_after = discover_organisations(
         loader, circles=circles, profiles=profiles, llm=llm
     )
 
     # 4. Chat assignments
-    chats = assign_chats(loader, organisations=organisations, circles=circles, profiles=profiles)
+    chats = assign_chats(loader, chat_map=chat_map, organisations=organisations, circles=circles)
 
     # 5. Open loops and help
     open_loops = extract_open_loops(loader, circles=circles, profiles=profiles, llm=llm)
@@ -71,6 +71,13 @@ def build_solution(input_dir: str, no_llm: bool = False) -> dict:
         for e in errs[:10]:
             print(f"  - {e}", file=sys.stderr)
 
+    cs = llm.cost_summary()
+    print(
+        f"LLM: {cs['calls']} calls ({cs['cached']} cached), "
+        f"{cs['prompt_tokens']} prompt + {cs['completion_tokens']} completion tokens, "
+        f"in {round(time.time() - started_time, 1)}s",
+        file=sys.stderr,
+    )
     return out
 
 

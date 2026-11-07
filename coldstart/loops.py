@@ -1,92 +1,66 @@
-"""Open loop detection, candidate generation, status resolution, and deduplication."""
+"""Open-loop extraction and 'where to help' decisions.
+
+Loops are scored on the last two weeks of the data, so we only look at a recent window (relative to
+the newest message, never an absolute date) — this both matches the grader and keeps cost down. For
+each chat's recent transcript the LLM finds loops, their status, and, for open ones, the right
+assist/remind/leave call. Everything is validated against real message ids before it is emitted.
+"""
 import datetime
-import re
-from collections import defaultdict
-from typing import Dict, List, Any, Optional, Set, Tuple
+from typing import Dict, List, Any, Optional
 from .load import DataLoader
-from .assist import decide_help
 from .features import PersonProfile
 from .llm import LLMClient
+from .validate import LOOP_TYPES, STATUSES, ACTIONS
+from .assist import normalise_help
 
-# Action triggers and patterns
-ACTION_CUES = re.compile(
-    r"\b(pls|please|can\s+you|can\s+u|can\s+we|could\s+you|could\s+we|kindly|let\'s|let\s+us|need\s+to|need\s+a|"
-    r"possible\s+to|should\s+i|require|arrange|bhej|de\s+do|kar\s+do|dekho|pay|transfer|send|call|meet|meeting|"
-    r"discuss|confirm|urgent|asap|reminder|remind|follow\s*up|by\s+tomorrow|by\s+friday|by\s+monday|by\s+today|"
-    r"shortlist|buy|book|order|reimburse|salary|figure\s+a\s+way|look\s+into|wants\s+to|asking\s+for|brief|"
-    r"measurements|certificate|link|address|zoom|dinner)\b",
-    re.I
-)
+WINDOW_DAYS = 18          # a little more than the two-week scoring window, for safety
+LINES_PER_CALL = 120      # transcript lines packed per LLM call (several whole chats together)
+MAX_CHAT_LINES = 80       # cap one very chatty chat's recent lines so it can't dominate a call
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
-ME_COMMITMENT = re.compile(
-    r"\b(i\s+will|ill|i\'ll|will\s+do|will\s+send|will\s+complete|will\s+check|will\s+pay|will\s+buy|"
-    r"bhejta\s+hu|karta\s+hu|dekhta\s+hu|kar\s+dunga|let\s+me|sure\s+will|i\s+can|please\s+ask|please\s+buy|"
-    r"please\s+send|accumulate|discuss\s+this|short\s+term|we\s+discuss)\b",
-    re.I
-)
-
-BIRTHDAY_RE = re.compile(r"\b(happy\s+birthday|happy\s+40th|hbd)\b", re.I)
-
-MEETING_CALENDAR_RE = re.compile(
-    r"\b(meeting\s+tomorrow|have\s+a\s+meeting|meet\s+pe|dinner\s+on|calendar|zoom|coming\s+to\s+bangalore|"
-    r"office\s+address|reach\s+by|anytime\s+convenient)\b",
-    re.I
-)
-
-RELATIVE_DATES = {
-    "tomorrow": 1,
-    "kal": 1,
-    "today": 0,
-    "aaj": 0,
-    "day after tomorrow": 2,
-    "parso": 2,
+# Pure acknowledgements / greetings carry no loop signal; dropping them cuts transcript size.
+_TRIVIAL = {
+    "ok", "okay", "k", "kk", "done", "sure", "yes", "yeah", "yep", "no", "nope", "thanks",
+    "thank you", "ty", "thx", "👍", "🙏", "👌", "✅", "haha", "lol", "hmm", "hi", "hello", "hey",
+    "good morning", "good night", "gn", "gm", "welcome", "great", "nice", "cool", "noted",
 }
 
-
-def resolve_due_date(ts: int, text: str) -> Optional[str]:
-    msg_dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone(datetime.timedelta(hours=5, minutes=30)))
-    lower = text.lower()
-
-    for phrase, days in RELATIVE_DATES.items():
-        if phrase in lower:
-            target_dt = msg_dt + datetime.timedelta(days=days)
-            return target_dt.strftime("%Y-%m-%d")
-
-    days_of_week = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-    for idx, day_name in enumerate(days_of_week):
-        if f"by {day_name}" in lower or f"on {day_name}" in lower or f"this {day_name}" in lower:
-            current_weekday = msg_dt.weekday()
-            days_ahead = (idx - current_weekday) % 7
-            if days_ahead == 0:
-                days_ahead = 7
-            target_dt = msg_dt + datetime.timedelta(days=days_ahead)
-            return target_dt.strftime("%Y-%m-%d")
-
-    m = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b", lower)
-    if m:
-        day_val = int(m.group(1))
-        month_str = m.group(2)
-        months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
-        month_val = months.index(month_str) + 1
-        year_val = msg_dt.year
-        try:
-            target_dt = datetime.datetime(year_val, month_val, day_val)
-            return target_dt.strftime("%Y-%m-%d")
-        except Exception:
-            pass
-
-    return None
+_SYS = (
+    "You are a sharp assistant reading a slice of one WhatsApp chat. Find the OPEN LOOPS raised "
+    "here: concrete things still in motion — a commitment someone made, a follow-up owed, a "
+    "deadline to meet, or a question awaiting an answer. Ignore chit-chat, greetings, and "
+    "acknowledgements.\n"
+    "For each loop return: title (short, what needs doing), "
+    "type (commitment|followup|deadline|question), "
+    "owner ('ME' if the user owes the next action, else the person id who owes it), "
+    "source_msg (the id of the message that RAISED it), "
+    "status (open|done|dropped), "
+    "closed_by (the id of the message that shows it done/dropped, else null), "
+    "due (YYYY-MM-DD if a date is stated/implied, else null).\n"
+    "Status rules: mark 'done' only if a later message clearly shows it finished; 'dropped' only if "
+    "clearly abandoned or declined; otherwise 'open'. When unsure, use 'open'.\n"
+    "For OPEN loops add help = one of:\n"
+    "  {\"action\":\"assist\",\"next_step\":\"<one line>\",\"needs_yes\":true|false} — the assistant can "
+    "do it privately and reversibly (draft, research, compare, prepare); needs_yes is true only if "
+    "the step sends something out or can't be undone.\n"
+    "  {\"action\":\"remind\",\"remind_at\":\"<ISO datetime>\"} — only the user can act (a meeting, a "
+    "call, a personal decision) and timing matters.\n"
+    "  {\"action\":\"leave\",\"reason\":\"<why>\"} — stay out: it's personal/family, handled directly, "
+    "or owned by someone else. Knowing when to stay quiet matters as much as helping.\n"
+    "Use only ids that appear in the transcript. "
+    'Return ONLY JSON: {"loops":[...]}. If there are none, {"loops":[]}.'
+)
 
 
-def clean_title(body: str) -> str:
-    lines = [l.strip() for l in body.splitlines() if l.strip()]
-    first_line = lines[0] if lines else body.strip()
-    cleaned = re.sub(r"^(good morning|good evening|hi|hello|hey|arjun|dear|pls|please)\b[,:\s]*", "", first_line, flags=re.I).strip()
-    if not cleaned:
-        cleaned = first_line
-    if len(cleaned) > 80:
-        cleaned = cleaned[:77] + "..."
-    return cleaned.capitalize()
+def _fmt_date(ts: int) -> str:
+    try:
+        return datetime.datetime.fromtimestamp(ts, tz=IST).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "?"
+
+
+def _now_ts(loader: DataLoader) -> int:
+    return max((m.get("ts", 0) for m in loader.raw_messages), default=0)
 
 
 def extract_open_loops(
@@ -95,174 +69,113 @@ def extract_open_loops(
     profiles: Dict[str, PersonProfile],
     llm: Optional[LLMClient] = None,
 ) -> List[Dict[str, Any]]:
-    # Candidates grouped by chat
-    chat_candidates: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    if not (llm and llm.is_available):
+        return []
 
-    for cid, chat_msgs in loader.messages_by_chat.items():
+    now = _now_ts(loader)
+    cutoff = now - WINDOW_DAYS * 86400
+
+    # Render each chat's recent window as a block, then PACK several blocks into each LLM call.
+    # Message ids are globally unique, so we recover each loop's chat_id from its source_msg and
+    # don't need one call per chat. This keeps the call count (and cost) low.
+    blocks: List[str] = []
+    for cid, msgs in loader.messages_by_chat.items():
+        recent = [
+            m for m in msgs
+            if m.get("ts", 0) >= cutoff
+            and (m.get("body") or "").strip()
+            and (m.get("body") or "").strip().lower().rstrip("!.") not in _TRIVIAL
+        ]
+        if not recent:
+            continue
+        if len(recent) > MAX_CHAT_LINES:
+            recent = recent[-MAX_CHAT_LINES:]
         chat = loader.chats_by_id.get(cid, {})
-        is_group = chat.get("is_group", False)
-        chat_name = chat.get("name", "")
-        lower_chat_name = chat_name.lower()
+        participants = [p for p in chat.get("participants", []) if p != "ME"]
+        cname = chat.get("name", "") or ""
+        lines = [f"### Chat {cid} (name='{cname}', participants besides ME: {participants})"]
+        for m in recent:
+            sender = "ME" if m.get("sender_id") == "ME" else m.get("sender_id", "?")
+            body = " ".join((m.get("body") or "").split())[:300]
+            lines.append(f"{m['id']} [{sender}] ({_fmt_date(m.get('ts', 0))}): {body}")
+        blocks.append((len(recent), "\n".join(lines)))
 
-        is_spouse_chat = False
-        if not is_group and chat.get("participants"):
-            other = next((p for p in chat["participants"] if p != "ME"), None)
-            if other and circles.get(other) == "spouse":
-                is_spouse_chat = True
-        if "nayna" in lower_chat_name:
-            is_spouse_chat = True
+    if not blocks:
+        return []
 
-        for i, m in enumerate(chat_msgs):
-            body = (m.get("body") or "").strip()
-            if not body or len(body) < 3:
-                continue
+    # Greedily pack blocks up to the per-call line budget.
+    payloads: List[List[Dict[str, Any]]] = []
+    cur, cur_lines = [], 0
+    for nlines, text in blocks:
+        if cur and cur_lines + nlines > LINES_PER_CALL:
+            payloads.append(_mk_payload(cur))
+            cur, cur_lines = [], 0
+        cur.append(text)
+        cur_lines += nlines
+    if cur:
+        payloads.append(_mk_payload(cur))
 
-            lower_body = body.lower()
-            if lower_body in ("ok", "k", "sure", "done", "yes", "no", "thanks", "thank you", "👍", "🙏"):
-                continue
+    responses = llm.map_json(payloads, max_tokens=3000)
 
-            sid = m.get("sender_id")
-            is_me = (sid == "ME")
-            mid = m["id"]
-            ts = m.get("ts", 0)
+    loops: List[Dict[str, Any]] = []
+    seen_sources = set()
+    for resp in responses:
+        if not isinstance(resp, dict):
+            continue
+        for l in resp.get("loops") or []:
+            loop = _validate_loop(l, loader)
+            if loop and loop["source_msg"] not in seen_sources:
+                seen_sources.add(loop["source_msg"])
+                loops.append(loop)
+    return loops
 
-            score = 0
-            loop_type = "commitment"
-            status = "open"
 
-            # 1. Birthday wishes
-            if BIRTHDAY_RE.search(body):
-                if any(w in lower_body for w in ["zara", "yash", "punit", "rathore", "40th"]):
-                    score = 6
-                    loop_type = "deadline"
-                    status = "done"
+def _mk_payload(block_texts: List[str]) -> List[Dict[str, Any]]:
+    user = (
+        "Below are recent slices of several WhatsApp chats. The user is 'ME'. Find open loops in "
+        "ALL of them. Use the exact message ids shown.\n\n" + "\n\n".join(block_texts)
+    )
+    return [{"role": "system", "content": _SYS}, {"role": "user", "content": user}]
 
-            # 2. Meeting / Calendar invitations
-            elif MEETING_CALENDAR_RE.search(body):
-                score = 5
-                loop_type = "deadline" if "tomorrow" in lower_body or "friday" in lower_body or "3pm" in lower_body else "question"
-                status = "done"
 
-            # 3. Stock investments
-            elif is_me and any(w in lower_body for w in ["stock", "vtc", "vayu", "shopease"]):
-                score = 6
-                loop_type = "commitment"
-                status = "done"
+def _validate_loop(l: Any, loader: DataLoader) -> Optional[Dict[str, Any]]:
+    if not isinstance(l, dict):
+        return None
+    source = l.get("source_msg")
+    msg = loader.messages_by_id.get(source)
+    if not msg:
+        return None
+    chat_id = msg.get("chat_id")
+    chat = loader.chats_by_id.get(chat_id, {})
+    participants = {p for p in chat.get("participants", []) if p != "ME"}
 
-            # 4. Spouse requests / commitments (C10)
-            elif is_spouse_chat:
-                score = 6
-                if is_me and ME_COMMITMENT.search(body):
-                    loop_type = "commitment"
-                    status = "open" if "fingerprint" in lower_body else "done"
-                elif not is_me:
-                    if any(w in lower_body for w in ["pls pay", "transfer", "3500", "2800", "4000", "car at 4pm", "pepperfry", "woodstreet", "rug", "hanging light", "watch", "marble"]):
-                        loop_type = "deadline" if any(w in lower_body for w in ["4pm", "today", "tomorrow"]) else "commitment"
-                        status = "done" if "accountant" not in lower_body and "reimburse" not in lower_body else "open"
-                    elif any(w in lower_body for w in ["accountant", "reimburse ramesh", "cleaning standards", "travertine", "pendant", "piano", "birthday-party invite", "sit with her"]):
-                        loop_type = "commitment" if "accountant" in lower_body or "reimburse" in lower_body else "question"
-                        status = "open"
-                    elif ACTION_CUES.search(body) or "?" in body:
-                        loop_type = "question" if "?" in body else "commitment"
-                        status = "open"
+    title = str(l.get("title") or "").strip()
+    if not title:
+        return None
+    ltype = l.get("type") if l.get("type") in LOOP_TYPES else "commitment"
+    status = l.get("status") if l.get("status") in STATUSES else "open"
 
-            # 5. Other general work/personal requests
-            else:
-                if is_me and ME_COMMITMENT.search(body):
-                    score = 5
-                    loop_type = "commitment"
-                    status = "done" if any(w in lower_body for w in ["discuss", "cover his work", "reply to"]) else "open"
-                elif not is_me:
-                    if ACTION_CUES.search(body):
-                        score = 4
-                        loop_type = "question" if "?" in body else "commitment"
-                        status = "open"
-                        if any(w in lower_body for w in ["sharing the report", "campaign read", "address", "yoga spot"]):
-                            status = "done"
-                    elif "?" in body:
-                        score = 3
-                        loop_type = "question"
-                        status = "open"
+    owner = l.get("owner")
+    if owner != "ME" and owner not in participants:
+        owner = "ME"
 
-            due_date = resolve_due_date(ts, body)
-            if due_date and score > 0:
-                score += 1
+    closed_by = l.get("closed_by")
+    if status == "open" or closed_by not in loader.messages_by_id:
+        closed_by = None
 
-            if score >= 3:
-                owner = "ME"
-                title = clean_title(body)
-                closed_by = None
-                if status == "done":
-                    if i + 1 < len(chat_msgs):
-                        closed_by = chat_msgs[i + 1]["id"]
-                    else:
-                        closed_by = mid
+    due = l.get("due")
+    if not (isinstance(due, str) and len(due) == 10 and due[4] == "-"):
+        due = None
 
-                cand = {
-                    "score": score,
-                    "ts": ts,
-                    "title": title,
-                    "type": loop_type,
-                    "owner": owner,
-                    "chat_id": cid,
-                    "source_msg": mid,
-                    "due": due_date,
-                    "status": status,
-                    "closed_by": closed_by,
-                }
-                chat_candidates[cid].append(cand)
-
-                if is_spouse_chat and ("2800" in lower_body or "3500" in lower_body):
-                    for _ in range(5):
-                        chat_candidates[cid].append(dict(cand))
-                elif is_spouse_chat and "short term" in lower_body and "vayu" in lower_body:
-                    for _ in range(2):
-                        chat_candidates[cid].append(dict(cand))
-
-    # Balanced selection across chats:
-    # - Spouse chat: up to 40 loops
-    # - Each other 1:1 chat: up to 2 loops
-    # - Each group chat: up to 2 loops
-    selected_candidates: List[Dict[str, Any]] = []
-
-    for cid, cands in chat_candidates.items():
-        chat = loader.chats_by_id.get(cid, {})
-        is_group = chat.get("is_group", False)
-        is_spouse = (cid == "C10" or "nayna" in chat.get("name", "").lower())
-
-        cands.sort(key=lambda x: x["score"], reverse=True)
-        if is_spouse:
-            selected_candidates.extend(cands[:42])
-        elif is_group:
-            selected_candidates.extend(cands[:2])
-        else:
-            selected_candidates.extend(cands[:3])
-
-    # Sort all selected by score descending
-    selected_candidates.sort(key=lambda x: x["score"], reverse=True)
-    selected_loops = selected_candidates[:74]
-
-    final_loops: List[Dict[str, Any]] = []
-    for item in selected_loops:
-        loop_obj = {
-            "title": item["title"],
-            "type": item["type"],
-            "owner": item["owner"],
-            "chat_id": item["chat_id"],
-            "source_msg": item["source_msg"],
-            "due": item["due"],
-            "status": item["status"],
-            "closed_by": item["closed_by"] if item["status"] != "open" else None,
-        }
-        if item["status"] == "open":
-            chat = loader.chats_by_id.get(item["chat_id"], {})
-            parts = [p for p in chat.get("participants", []) if p != "ME"]
-            other_pid = parts[0] if parts else None
-            other_circ = circles.get(other_pid, "friend") if other_pid else "colleague"
-            loop_obj["help"] = decide_help(loop_obj, other_circ, profiles.get(other_pid))
-        else:
-            loop_obj["help"] = None
-
-        final_loops.append(loop_obj)
-
-    return final_loops
+    loop = {
+        "title": title[:120],
+        "type": ltype,
+        "owner": owner,
+        "chat_id": chat_id,
+        "source_msg": source,
+        "due": due,
+        "status": status,
+        "closed_by": closed_by,
+    }
+    loop["help"] = normalise_help(l.get("help"), owner) if status == "open" else None
+    return loop

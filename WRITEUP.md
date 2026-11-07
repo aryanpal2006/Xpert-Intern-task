@@ -1,87 +1,93 @@
-# Cold Start Solution Write-up
+# Cold Start — Write-up
 
-## 1. What I Focused On, and Why
+## 1. Focus, and why
 
-The solution is architected strictly around the challenge's scoring weights and loss asymmetry:
-- **Open Loops & Where to Help (38 points total: 28 for loops + 10 for help):** This is the decisive scoring block. In `check.py`, calling an open loop "done" or "dropped" when it is actually open penalizes by subtracting 1 point, and saying `assist` or `remind` on a loop that should be `leave` also penalizes by subtracting 1 point. I focused heavily on high-precision candidate extraction, asymmetric conservative status resolution (defaulting to `open`), and strict `leave`-first assistance rubrics.
-- **Circles, Organisations, and Chats (28 points combined: 12 circles, 8 orgs, 8 chats):** Deterministic relational cues, group membership graph topology, and kinship linguistic markers provide massive point yield at near-zero token cost. Tying 1:1 chats to their respective counterparts and group chats to parent organisations achieves near-perfect chat accuracy (~0.98 on dev) and strong organisation Jaccard overlap.
-- **Cost (12 points) and Runtime (7 points):** Designed from day one to execute in under one second on standard Python 3.9+ without third-party dependencies, featuring on-disk caching, graceful `--no-llm` deterministic fallbacks, and multi-tier LLM integration.
-- **Goals (8 points):** Tuned for strict precision over recall. Because hallucinated or unbacked goals penalize the F1 score, the system only outputs goals anchored by verified message IDs.
+The hidden set is **re-anonymised**: every name and id changes. So the one thing that matters is
+that nothing keys off a specific name. I treat every chat as structure + content, and let an LLM
+read the *content* to decide relationships — never a lookup of known names.
 
----
+I spent effort where the points and the loss-asymmetry are:
 
-## 2. My Approach
+- **Open loops + where to help (38 pts):** the biggest block. `check.py` subtracts a point for
+  calling an open loop `done`/`dropped`, and subtracts a point for `assist`/`remind` where the
+  answer is `leave`. So status defaults to `open` when unsure, and help defaults to `leave` when
+  unsure.
+- **Circles / organisations / chats (28 pts):** chats are almost free from structure (1:1 → person,
+  group → organisation). Circles and org-clustering are done by the LLM from message content.
+- **Goals (8 pts):** precision over recall — every goal must cite a real message id, or it is
+  dropped, because an invented goal costs F1.
+- **Cost (12 pts):** calls are batched (many chats per prompt), the loop pass only reads the recent
+  window that is actually scored, trivial acks are stripped, and every call is disk-cached.
 
-The pipeline executes in six modular stages:
+## 2. Approach
 
-```
-                  ┌──────────────────────┐
-                  │ Raw Chats & Messages │
-                  └──────────┬───────────┘
-                             │
-                  ┌──────────▼───────────┐
-                  │  Feature Extraction  │ (Profiles, message counts, group overlaps)
-                  └──────────┬───────────┘
-         ┌───────────────────┼───────────────────┐
-         │                   │                   │
-┌────────▼─────────┐┌────────▼─────────┐┌────────▼─────────┐
-│ Circle Classifier││   Org Clustering ││  Goal Extractor  │
-│ (Kinship, Staff, ││ (Seed, Home, Farm││ (Health, Travel, │
-│  Colleagues, etc)││  Derive Runs/Sup)││  Work Milestones)│
-└────────┬─────────┘└────────┬─────────┘└────────┬─────────┘
-         │                   │                   │
-         └─────────┬─────────┴───────────────────┘
-                   │
-         ┌─────────▼──────────┐
-         │   Chat Tie Engine  │ (1:1 -> Person/Org, Groups -> Org)
-         └─────────┬──────────┘
-                   │
-         ┌─────────▼──────────┐
-         │ Open Loops Engine  │ (Spouse requests, commitments, relative dates)
-         └─────────┬──────────┘
-                   │
-         ┌─────────▼──────────┐
-         │   Where to Help    │ (Strict leave-first rubric, assist, remind)
-         └─────────┬──────────┘
-                   │
-         ┌─────────▼──────────┐
-         │ Validated output   │
-         └────────────────────┘
-```
+Pipeline (`coldstart/`), one command via `run.sh <input_dir> <output.json>`:
 
-1. **Loader & Profiler (`load.py`, `features.py`):** Ingests JSONL data, normalizes timestamps into IST (+05:30), indexes bidirectional communication, and extracts kinship, internal operations, client, and staff tokens.
-2. **Circle Classification (`circles.py`):** Identifies Arjun's household surname and single spouse via interaction volume, isolates domestic/office staff via operational keywords (`driver`, `maid`, `office boy`), separates internal colleagues running operations from external clients, and clusters friends via sports/recreational clubs (pickleball, table tennis).
-3. **Organisations & Links (`orgs.py`):** Anchors on `seed.json` companies (`PostMyAd`, `NEXUS`), discovers internal ventures (`Nexus DaaS`, `Radiant`), workspaces (`Office`), and domestic residences (`Home`, `Farmhouse`). Automatically derives `runs` for colleagues/partners and `supports` for staff.
-4. **Chat Ties (`chats.py`):** Maps 1:1 personal chats to participants and operational 1:1s to respective orgs; clusters group chats to their corresponding parent organisation.
-5. **Open Loops & Status (`loops.py`):** Scans for explicit ME commitments ("I will", "bhejta hu"), spouse action items, financial disbursements, and deadline markers. Resolves relative dates against message timestamps. Applies conservative status resolution: only marks `done` when an unambiguous confirmation message appears, completely avoiding false-completion penalties.
-6. **Where to Help (`assist.py`):** Categorizes open loops using a weighted cost rubric: defaults to `leave` on spouse/family personal matters and items owned by others; assigns `assist` with `needs_yes` for research and bookings; assigns `remind` for executive decisions and meetings.
+1. **load.py / features.py** — index chats, messages, people; build a *name-light* profile per
+   person (direct vs group, message volume, a few sample lines each way). No hardcoded names.
+2. **circles.py** — the LLM reads each person's profile in batches and picks a circle from the
+   fixed vocabulary. Seeded circles are trusted as-is. Fallback: a generic kinship/structure
+   heuristic when no model is available.
+3. **orgs.py** — the LLM clusters **group chats** into the user's *own* organisations (home,
+   companies, workspace, second home, society, school), assigns each group to one, and labels each
+   member `runs`/`supports`. A vendor's or client's own company is explicitly **not** an
+   organisation.
+4. **chats.py** — 1:1 chats tie to the person; group chats tie to their organisation; any leftover
+   group is attached by the circle-majority of its members so no chat is ever untied.
+5. **loops.py** — only the **last ~18 days** (the scored window is the last two weeks). Recent
+   transcripts from several chats are packed into each prompt; the LLM returns each loop's title,
+   type, owner, `source_msg`, status, `closed_by`, and — for open loops — the help call. Everything
+   is validated against real message ids (a loop's chat is recovered from its `source_msg`, since
+   ids are globally unique).
+6. **assist.py** — normalises each help object; defaults to `leave` for anything missing, malformed,
+   or owned by someone else.
 
----
+**LLM client (`coldstart/llm.py`)** reads `LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL`, runs calls
+concurrently, disk-caches by prompt hash, logs tokens to `usage.jsonl`, retries with backoff
+(honouring `Retry-After`), sends a normal `User-Agent` (some gateways block the default), and — for
+reasoning models that choke on strict `json_object` on large outputs — transparently retries without
+`response_format` and parses the JSON out of the reply.
 
-## 3. What It Costs
+## 3. Cost
 
-| Mode | Model | Prompt Tokens | Completion Tokens | Total Cost / 1k msgs | Dominant Stage |
-|---|---|---|---|---|---|
-| **Deterministic (`--no-llm`)** | None | 0 | 0 | **$0.00** | Plain Python (< 0.5s) |
-| **LLM Tier (Default)** | `gemini-2.5-flash-lite` | ~18k | ~2.5k | **~$0.005** | Ambiguous Circle & Loop boundary calls |
-| **LLM Tier (Strong)** | `gemini-2.5-flash` | ~25k | ~3k | **~$0.02** | Goal and multi-turn open loop extraction |
+Measured on the example (6 chats, 29 messages) and the dev set (138 chats, 4,502 messages).
 
-The pipeline disk-caches every API call in `.cache_llm/` hashed by prompt and parameters, meaning subsequent runs cost $0.00. Token spend is 85% concentrated on open loop boundary validation and 15% on ambiguous group-only circle classification.
+| | model | calls | prompt toks | completion toks |
+|---|---|---|---|---|
+| Example (complete) | gemini-2.5-flash-lite | ~9 | ~5.3k | ~1.5k |
+| Example (complete) | openai/gpt-oss-120b | ~5 | ~3.4k | ~5.0k |
+| Dev, ~4.5k msgs (full attempt) | openai/gpt-oss-120b | ~40 | ~45k | ~28k |
 
----
+So a full dev pass is on the order of ~70–90k tokens for ~4,500 messages. At flash-lite / gpt-oss
+pricing (~$0.15–0.60 / 1M tokens) that is well under **$0.05 per 1,000 messages**. Money goes mostly
+to the loop pass (recent-window transcripts); circles/orgs/goals are a handful of calls. It is kept
+down by the loop window, cross-chat packing, ack-stripping, and disk caching (a repeat run is free).
 
-## 4. Where It's Wrong & Calibration
+**Model to run it with:** `google/gemini-2.5-flash-lite` (best accuracy/cost in my tests);
+`openai/gpt-oss-120b` also works. Any OpenAI-compatible model is fine — nothing depends on `seed` or
+on `json_object`.
 
-Based on dev-set error analysis (4,502 messages, 138 chats), here are the expected error modes and predicted performance shifts on the hidden set:
+> Note on testing: my own Groq/Gemini keys are free-tier, where the token-per-minute cap throttles a
+> full 4,502-message dev run (so some calls fall back mid-run). The grader's OpenRouter key is not
+> so limited; the design stays within the 30-minute budget there. The example scores below are on a
+> fully-completed run.
 
-1. **Circle Classification Errors (~15–22% expected error rate):**
-   - *Failure mode:* Group-only participants with zero direct 1:1 messages lack conversational signals. In dev, relatives sharing group chats with colleagues or sports friends without common surnames can be misclassified.
-   - *Hidden set prediction:* Will slightly degrade if new family members or peripheral vendors lack typical Indian kinship/honorific cues.
-2. **Open Loops Status Asymmetry (~15–20% precision / ~25–35% recall):**
-   - *Failure mode:* Multilingual Hinglish idioms ("de do", "dekh liyo", "ho gaya samjho") and implicit conversational completions that span multiple days without an explicit "done".
-   - *Calibration choice:* By design, the engine intentionally prefers false negatives over false "done" calls because `check.py` subtracts 1 full point for marking an open loop as done. This sacrifice protects the total score.
-3. **Where to Help Errors (~20–30% error rate):**
-   - *Failure mode:* Boundary between `leave` and `remind`. Arjun occasionally appreciates reminders for domestic appointments that look like "leave" territory.
-   - *Calibration choice:* Uncertain loops are routed to `leave`, as false `assist`/`remind` calls on `leave` ground truths carry a -1 penalty.
-4. **Hidden Set Name Re-anonymization:**
-   - The solution uses zero hardcoded personal names or static IDs. All features derive dynamically from lexical patterns, graph topology, and relative timestamps, ensuring robust generalization to the hidden 6-week evaluation set.
+## 4. Where it's wrong
+
+Example score (fully completed): circles 1.00, orgs 0.80, chats 1.00, goals 1.00, loops-found 0.76,
+loops-closed 0.80, help 0.60 — **≈62/74** (gemini-2.5-flash-lite); old overfit code scored 17/74 on
+this same unseen example.
+
+Expected mistakes on the hidden set:
+
+1. **Loops — recall ~25–40% miss, status ~15–25% off.** Hinglish/implicit completions ("ho gaya",
+   "de diya") and loops that close days later across a chunk boundary. By design it under-reports
+   `done` to avoid the −1 penalty, so misses lean toward false-negatives, not false "done".
+2. **Where to help ~20–35% off.** The `leave` vs `remind` line is genuinely subjective; I bias to
+   `leave` because stepping in wrongly is the only move that costs points.
+3. **Organisations — under/over-clustering.** The grader matches by shared chats+people, so merging
+   two real ventures or splitting one lowers the score; the fuzzier the group content, the worse.
+4. **Circles for peripheral people** seen only inside a mixed group with almost no messages — little
+   signal, so these fall back to a structural guess.
+5. **Generalisation:** there are **no** hardcoded names, ids, places, or amounts anywhere; all
+   signal is message content, chat structure, and relative timestamps.

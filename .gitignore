@@ -14,6 +14,10 @@ cold-start/usage.jsonl
 .cache_llm/
 cold-start/.cache_llm/
 
+# Local secrets (API keys) — never commit
+secrets/
+*.key
+
 # Python & IDE
 __pycache__/
 *.py[cod]
@@ -21,3 +25,4 @@ __pycache__/
 .env
 .venv/
 .vscode/
+

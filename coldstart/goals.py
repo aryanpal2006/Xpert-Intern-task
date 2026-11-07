@@ -1,98 +1,93 @@
-"""Goal extraction based on explicit aspirations, milestones, and commitments."""
+"""Goal extraction: the things the user cares about, drawn from what they actually discuss.
+
+We shortlist aspiration-bearing messages with generic (name-free) cues, then the LLM turns them into
+up to 10 goals, each citing real message ids as evidence. Evidence ids are validated against the
+input; a goal with no valid evidence is dropped, because inventing goals costs points.
+"""
 import re
 from typing import Dict, List, Any, Optional, Tuple
 from .load import DataLoader
 from .llm import LLMClient
+from .validate import AREAS, GOAL_TYPES, HORIZONS
 
-GOAL_KEYWORDS = {
-    "health": re.compile(r"\b(marathon|running|half\s*marathon|10k|5k|gym|workout|weight\s*loss|diet|fitness|trainer)\b", re.I),
-    "work": re.compile(r"\b(clients|retainer|revenue|target|launch|arr|mrr|fundraise|valuation|hiring|expansion|brightside)\b", re.I),
-    "experiences": re.compile(r"\b(vacation|trip|holiday|travel|coorg|tadoba|alibaug|europe|japan|flight|resort|safari)\b", re.I),
-    "finances": re.compile(r"\b(portfolio|invest|crore|lakh|savings|shares|property|stocks|fd|wealth)\b", re.I),
-    "kids": re.compile(r"\b(admission|school|tuition|piano|tennis|exam|swimming|grades)\b", re.I),
-    "home": re.compile(r"\b(renovation|interior|furnishing|flat|apartment|bungalow|villa|marble|kitchen)\b", re.I),
-}
+# Generic aspiration / intent language (no personal names, no dev specifics).
+ASPIRATION = re.compile(
+    r"\b(want to|wanna|plan to|planning|goal|target|aim|aiming|hope to|hoping|dream|plan on|"
+    r"this year|next year|by (jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|q[1-4]|year end|"
+    r"end of)|plan is|resolution|plan for|save up|saving for|invest|learn|start|launch|grow|"
+    r"scale|build|expand|get fit|lose weight|marathon|run a|training for|buy a|move to|shift to|"
+    r"renovat|admission|get into|crack|milestone|long term|some day|someday|one day|eventually)\b",
+    re.I,
+)
+
+_SYS = (
+    "You read a person's WhatsApp and list the GOALS they genuinely care about — things they are "
+    "working toward over months or years, shown repeatedly in what they talk about. Not one-off "
+    "errands. For each goal give: title (short, concrete), "
+    "area (self|spouse|kids|parents|work|friends|experiences|finances|health|home), "
+    "type (habit|milestone|experience), horizon (3mo|1yr|3yr|5yr), and evidence = a list of 1-3 "
+    "message ids (from the ids shown) that show it. Use only ids that appear in the input. "
+    "Prefer fewer, well-evidenced goals over many weak ones. Return at most 10.\n"
+    'Return ONLY JSON: {"goals":[{"title":...,"area":...,"type":...,"horizon":...,"evidence":["M.."]}]}'
+)
 
 
-def extract_goals(
-    loader: DataLoader,
-    llm: Optional[LLMClient] = None,
-) -> List[Dict[str, Any]]:
-    """Extract up to 5-10 well-evidenced goals from the messages."""
-    goals: List[Dict[str, Any]] = []
-    all_msg_ids = set(loader.messages_by_id.keys())
-
-    # Search for evidence of genuine goals across categories
-    candidate_evidence: Dict[str, List[Tuple[str, str, int]]] = {area: [] for area in GOAL_KEYWORDS}
-
+def _candidates(loader: DataLoader, cap: int = 140) -> List[Tuple[str, str]]:
+    cands: List[Tuple[str, str, int]] = []
     for m in loader.raw_messages:
         body = (m.get("body") or "").strip()
-        if len(body) < 10 or len(body) > 400:
+        if len(body) < 12 or len(body) > 400:
             continue
-        # Skip pure forwards
         if "forwarded" in body.lower():
             continue
+        if ASPIRATION.search(body):
+            # Prefer the user's own statements of intent.
+            weight = 2 if m.get("sender_id") == "ME" else 1
+            cands.append((m["id"], " ".join(body.split()), weight))
+    cands.sort(key=lambda x: x[2], reverse=True)
+    return [(mid, text) for mid, text, _ in cands[:cap]]
 
-        for area, pat in GOAL_KEYWORDS.items():
-            if pat.search(body):
-                candidate_evidence[area].append((m["id"], body, m.get("ts", 0)))
 
-    # If there are seeded goals, find supporting evidence messages for them in candidate_evidence
-    seeded_goals = loader.seed.get("goals", [])
-    for g in seeded_goals:
-        if isinstance(g, dict) and "title" in g and "area" in g:
-            area = g["area"]
-            # Look for matching evidence in messages
-            matched_ev = []
-            ev_candidates = candidate_evidence.get(area, [])
-            g_title_words = set(re.findall(r"\w+", g["title"].lower()))
-            for mid, body, _ in ev_candidates:
-                msg_words = set(re.findall(r"\w+", body.lower()))
-                if len(g_title_words & msg_words) >= 2:
-                    matched_ev.append(mid)
-                    if len(matched_ev) >= 2:
-                        break
-            if not matched_ev and ev_candidates:
-                matched_ev = [ev_candidates[0][0]]
+def extract_goals(loader: DataLoader, llm: Optional[LLMClient] = None) -> List[Dict[str, Any]]:
+    cands = _candidates(loader)
+    valid_ids = set(loader.messages_by_id.keys())
+    if not cands or not (llm and llm.is_available):
+        return []
 
-            if matched_ev:
-                goals.append({
-                    "title": g["title"],
-                    "area": g["area"],
-                    "type": g.get("type", "milestone"),
-                    "horizon": g.get("horizon", "1yr"),
-                    "evidence": matched_ev,
-                })
+    # Chunk candidates so each prompt stays small; merge afterwards.
+    chunks = [cands[i:i + 70] for i in range(0, len(cands), 70)]
+    payloads = []
+    for ch in chunks:
+        listing = "\n".join(f"{mid}: {text}" for mid, text in ch)
+        payloads.append([
+            {"role": "system", "content": _SYS},
+            {"role": "user", "content": "Messages:\n" + listing},
+        ])
 
-    # For other areas with strong evidence, formulate a concrete goal
-    used_areas = {g["area"] for g in goals}
-    for area, ev_list in candidate_evidence.items():
-        if len(goals) >= 6:
-            break
-        if area in used_areas or not ev_list:
+    responses = llm.map_json(payloads, strong=True, max_tokens=1500)
+    goals: List[Dict[str, Any]] = []
+    seen_titles = set()
+    for resp in responses:
+        if not isinstance(resp, dict):
             continue
-
-        aspiration_candidates = [
-            (mid, text) for (mid, text, ts) in ev_list
-            if any(w in text.lower() for w in ["target", "plan", "goal", "trip", "january", "december", "march", "run", "reach", "complete", "book"])
-        ]
-        chosen = aspiration_candidates[0] if aspiration_candidates else ev_list[0]
-        mid, text = chosen[0], chosen[1]
-
-        clean_text = re.sub(r"[\n\r]+", " ", text).strip()
-        if len(clean_text) > 60:
-            clean_text = clean_text[:57] + "..."
-
-        g_type = "experience" if area == "experiences" else "milestone"
-        g_horizon = "3mo" if any(w in text.lower() for w in ["december", "january", "soon", "next month"]) else "1yr"
-
-        goals.append({
-            "title": f"Plan for {area}: {clean_text}",
-            "area": area,
-            "type": g_type,
-            "horizon": g_horizon,
-            "evidence": [mid],
-        })
-        used_areas.add(area)
-
-    return goals[:8]
+        for g in resp.get("goals") or []:
+            if not isinstance(g, dict):
+                continue
+            title = str(g.get("title") or "").strip()
+            area = g.get("area")
+            gtype = g.get("type")
+            horizon = g.get("horizon")
+            ev = [e for e in (g.get("evidence") or []) if e in valid_ids]
+            if not title or area not in AREAS or gtype not in GOAL_TYPES or horizon not in HORIZONS:
+                continue
+            if not ev:
+                continue
+            key = title.lower()
+            if key in seen_titles:
+                continue
+            seen_titles.add(key)
+            goals.append({
+                "title": title, "area": area, "type": gtype,
+                "horizon": horizon, "evidence": ev[:3],
+            })
+    return goals[:10]

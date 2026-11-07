@@ -1,3 +1,0 @@
-# Cold Start Challenge dependencies
-# Standard library only (Python 3.9+) ensures 100% portable, zero-install execution under 30 minutes
-
